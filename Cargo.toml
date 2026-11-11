@@ -1,0 +1,21 @@
+[package]
+name = "tiny-http-server"
+version = "1.0.0"
+edition = "2024"
+authors = ["Bálint Máté <balint.mate.2006@gmail.com>"]
+description = "A lightweight asynchronous HTTP/1.1 server"
+repository = "https://github.com/Zodey-hub/tiny-http-server"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["http", "http1", "server", "async", "web"]
+categories = ["web-programming::http-server", "network-programming", "asynchronous"]
+
+[dependencies]
+async-executor = "1"
+async-io = "2"
+async-net = "2"
+bytes = "1"
+futures-lite = "2"
+http = "1"
+httparse = "1"
+thiserror = "2"
