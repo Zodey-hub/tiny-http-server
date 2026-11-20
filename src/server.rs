@@ -95,6 +95,7 @@ pub struct ServerBuilder {
 
 impl ServerBuilder {
     /// Start from the defaults.
+    #[must_use]
     pub fn new() -> Self {
         let threads = thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
 
