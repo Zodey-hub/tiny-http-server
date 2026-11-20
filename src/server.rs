@@ -1,7 +1,9 @@
 //! Connection acceptance and the per-connection request loop.
 
+use std::convert::Infallible;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::io;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::num::NonZeroUsize;
 use std::thread::{self, Scope};
 use std::time::Duration;
@@ -9,13 +11,13 @@ use std::time::Duration;
 use async_channel::Receiver;
 use async_executor::Executor;
 use async_io::Timer;
-use async_net::{AsyncToSocketAddrs, TcpListener};
+use async_net::TcpListener;
 use futures_lite::{AsyncRead, AsyncWrite, future};
 use http::Method;
 
 use crate::request::{RequestReader, wants_keep_alive};
 use crate::response::{ResponseWriter, status_only};
-use crate::{CONNECTION_TIMEOUT, Error, Handler, IDLE_TIMEOUT, Limits};
+use crate::{CONNECTION_TIMEOUT, Handler, IDLE_TIMEOUT, Limits};
 
 /// An HTTP/1.1 server that dispatches every request to a single [`Handler`].
 pub struct Server<H> {
@@ -28,13 +30,13 @@ pub struct Server<H> {
 impl<H: Handler> Server<H> {
     /// Bind `addr` and create a server with the default settings of [`ServerBuilder`] that routes every request to `handler`.
     ///
-    /// `addr` is any address `async-net` can resolve, such as `"127.0.0.1:8080"`.
+    /// `addr` is any address [`ToSocketAddrs`] takes, such as `"127.0.0.1:8080"`.
     /// Binding port `0` lets the operating system pick a free port; [`Server::local_addr`] reports which one.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] if the address cannot be bound.
-    pub fn bind<A: AsyncToSocketAddrs>(addr: A, handler: H) -> Result<Self, Error> {
+    /// Returns an error if the address cannot be resolved or bound.
+    pub fn bind<A: ToSocketAddrs>(addr: A, handler: H) -> io::Result<Self> {
         ServerBuilder::new().bind(addr, handler)
     }
 
@@ -42,20 +44,19 @@ impl<H: Handler> Server<H> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] if the operating system cannot report the address.
-    pub fn local_addr(&self) -> Result<SocketAddr, Error> {
-        Ok(self.listener.local_addr()?)
+    /// Returns an error if the operating system cannot report the address.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
     }
 
-    /// Serve connections until an accept error occurs.
+    /// Serve connections until an accept error occurs, so it returns only an error.
     ///
     /// The current thread only accepts the connections, the threads of [`ServerBuilder::threads`] serve them on one shared executor, so a handler that blocks holds up only its own thread.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] if a thread cannot be started or the listener stops accepting.
-    /// The success arm is unreachable: on a healthy listener this call never returns.
-    pub fn run(&self) -> Result<(), Error> {
+    /// Returns an error if a thread cannot be started or the listener stops accepting.
+    pub fn run(&self) -> io::Result<Infallible> {
         let executor = Executor::new();
         let (stop_sender, stop_receiver) = async_channel::bounded::<()>(1);
 
@@ -72,7 +73,7 @@ impl<H: Handler> Server<H> {
         scope: &'scope Scope<'scope, '_>,
         executor: &'scope Executor<'server>,
         stop: &Receiver<()>,
-    ) -> Result<(), Error> {
+    ) -> io::Result<Infallible> {
         for _ in 0..self.threads.get() {
             let stop = stop.clone();
             thread::Builder::new().spawn_scoped(scope, move || {
@@ -126,18 +127,15 @@ impl ServerBuilder {
 
     /// Bind `addr` and create a server with these settings that routes every request to `handler`.
     ///
-    /// `addr` is any address `async-net` can resolve, such as `"127.0.0.1:8080"`.
+    /// `addr` is any address [`ToSocketAddrs`] takes, such as `"127.0.0.1:8080"`.
     /// Binding port `0` lets the operating system pick a free port; [`Server::local_addr`] reports which one.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] if the address cannot be bound.
-    pub fn bind<A: AsyncToSocketAddrs, H: Handler>(
-        self,
-        addr: A,
-        handler: H,
-    ) -> Result<Server<H>, Error> {
-        let listener = async_io::block_on(TcpListener::bind(addr))?;
+    /// Returns an error if the address cannot be resolved or bound.
+    pub fn bind<A: ToSocketAddrs, H: Handler>(self, addr: A, handler: H) -> io::Result<Server<H>> {
+        let listener = std::net::TcpListener::bind(addr)?;
+        let listener = async_net::TcpListener::try_from(listener)?;
 
         Ok(Server {
             listener,
@@ -160,7 +158,7 @@ async fn accept_connections<'a, H: Handler>(
     handler: &'a H,
     limits: Limits,
     executor: &Executor<'a>,
-) -> Result<(), Error> {
+) -> io::Result<Infallible> {
     loop {
         let (stream, _peer) = listener.accept().await?;
 

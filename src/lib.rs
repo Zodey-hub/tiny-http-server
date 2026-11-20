@@ -9,9 +9,8 @@ mod request;
 mod response;
 mod server;
 
-pub use async_net::AsyncToSocketAddrs;
 pub use bytes::Bytes;
-pub use error::Error;
+use error::Error;
 pub use handler::Handler;
 pub use server::{Server, ServerBuilder};
 

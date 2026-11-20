@@ -2,10 +2,9 @@
 
 use http::StatusCode;
 
-/// Everything that can go wrong while serving a connection.
+/// Everything that can go wrong while serving a connection; it ends the connection, it never reaches the caller of the server.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum Error {
+pub(crate) enum Error {
     /// The underlying socket failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -23,18 +22,12 @@ pub enum Error {
     InvalidField(#[from] http::Error),
 
     /// The request line and headers exceeded the limit of [`ServerBuilder::max_head_bytes`](crate::ServerBuilder::max_head_bytes).
-    #[error("request head exceeds {limit} bytes")]
-    HeadTooLarge {
-        /// The limit, in bytes.
-        limit: usize,
-    },
+    #[error("request head exceeds the limit")]
+    HeadTooLarge,
 
     /// `Content-Length` exceeded the limit of [`ServerBuilder::max_body_bytes`](crate::ServerBuilder::max_body_bytes).
-    #[error("request body exceeds {limit} bytes")]
-    BodyTooLarge {
-        /// The limit, in bytes.
-        limit: usize,
-    },
+    #[error("request body exceeds the limit")]
+    BodyTooLarge,
 
     /// `Content-Length` was absent-but-required, duplicated, or not a number.
     #[error("missing or malformed Content-Length")]
@@ -51,15 +44,15 @@ pub enum Error {
 
 impl Error {
     /// The status code to report to the peer, or `None` if the peer is unreachable.
-    pub fn client_status(&self) -> Option<StatusCode> {
+    pub(crate) fn client_status(&self) -> Option<StatusCode> {
         match self {
             Error::Io(_) | Error::UnexpectedEof => None,
             Error::Parse(_)
             | Error::InvalidField(_)
             | Error::InvalidContentLength
             | Error::UnsupportedVersion => Some(StatusCode::BAD_REQUEST),
-            Error::HeadTooLarge { .. } => Some(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
-            Error::BodyTooLarge { .. } => Some(StatusCode::PAYLOAD_TOO_LARGE),
+            Error::HeadTooLarge => Some(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
+            Error::BodyTooLarge => Some(StatusCode::PAYLOAD_TOO_LARGE),
             Error::UnsupportedTransferEncoding => Some(StatusCode::NOT_IMPLEMENTED),
         }
     }

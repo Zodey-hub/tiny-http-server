@@ -71,21 +71,18 @@ impl<R: AsyncRead + Unpin> RequestReader<R> {
     /// Read until a whole head is buffered and return its length, or `None` on a clean end-of-stream at a request boundary.
     async fn locate_head(&mut self) -> Result<Option<usize>, Error> {
         let max_head_bytes = self.limits.max_head_bytes;
-        let head_too_large = Error::HeadTooLarge {
-            limit: max_head_bytes,
-        };
 
         loop {
             if let Some(head_len) = complete_head_len(&self.buffer)? {
                 if head_len > max_head_bytes {
-                    return Err(head_too_large);
+                    return Err(Error::HeadTooLarge);
                 }
 
                 return Ok(Some(head_len));
             }
 
             if self.buffer.len() > max_head_bytes {
-                return Err(head_too_large);
+                return Err(Error::HeadTooLarge);
             }
 
             if self.fill().await? == 0 {
@@ -205,9 +202,7 @@ fn content_length(headers: &HeaderMap, max_body_bytes: usize) -> Result<usize, E
         .map_err(|_| Error::InvalidContentLength)?;
 
     if length > max_body_bytes {
-        return Err(Error::BodyTooLarge {
-            limit: max_body_bytes,
-        });
+        return Err(Error::BodyTooLarge);
     }
 
     Ok(length)
