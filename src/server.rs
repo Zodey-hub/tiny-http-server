@@ -2,8 +2,11 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::thread::{self, Scope};
 use std::time::Duration;
 
+use async_channel::Receiver;
 use async_executor::Executor;
 use async_io::Timer;
 use async_net::{AsyncToSocketAddrs, TcpListener};
@@ -12,16 +15,18 @@ use http::Method;
 
 use crate::request::{RequestReader, wants_keep_alive};
 use crate::response::{ResponseWriter, status_only};
-use crate::{CONNECTION_TIMEOUT, Error, Handler, IDLE_TIMEOUT};
+use crate::{CONNECTION_TIMEOUT, Error, Handler, IDLE_TIMEOUT, Limits};
 
 /// An HTTP/1.1 server that dispatches every request to a single [`Handler`].
 pub struct Server<H> {
     listener: TcpListener,
     handler: H,
+    limits: Limits,
+    threads: NonZeroUsize,
 }
 
 impl<H: Handler> Server<H> {
-    /// Bind `addr` and create a server that routes every request to `handler`.
+    /// Bind `addr` and create a server with the default settings of [`ServerBuilder`] that routes every request to `handler`.
     ///
     /// `addr` is any address `async-net` can resolve, such as `"127.0.0.1:8080"`.
     /// Binding port `0` lets the operating system pick a free port; [`Server::local_addr`] reports which one.
@@ -30,8 +35,7 @@ impl<H: Handler> Server<H> {
     ///
     /// Returns [`Error::Io`] if the address cannot be bound.
     pub fn bind<A: AsyncToSocketAddrs>(addr: A, handler: H) -> Result<Self, Error> {
-        let listener = async_io::block_on(TcpListener::bind(addr))?;
-        Ok(Self { listener, handler })
+        ServerBuilder::new().bind(addr, handler)
     }
 
     /// The address the listener is bound to, including the port the operating system picked when port `0` was requested.
@@ -43,18 +47,110 @@ impl<H: Handler> Server<H> {
         Ok(self.listener.local_addr()?)
     }
 
-    /// Serve connections on the current thread until an accept error occurs.
+    /// Serve connections until an accept error occurs.
     ///
-    /// Runs every connection on a single-threaded executor owned by this call.
+    /// The current thread only accepts the connections, the threads of [`ServerBuilder::threads`] serve them on one shared executor, so a handler that blocks holds up only its own thread.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] if the listener stops accepting.
+    /// Returns [`Error::Io`] if a thread cannot be started or the listener stops accepting.
     /// The success arm is unreachable: on a healthy listener this call never returns.
     pub fn run(&self) -> Result<(), Error> {
         let executor = Executor::new();
-        let accept_loop = accept_connections(&self.listener, &self.handler, &executor);
-        async_io::block_on(executor.run(accept_loop))
+        let (stop_sender, stop_receiver) = async_channel::bounded::<()>(1);
+
+        thread::scope(|scope| {
+            let served = self.serve(scope, &executor, &stop_receiver);
+            drop(stop_sender);
+            served
+        })
+    }
+
+    /// Start the worker threads of `executor` in `scope`, then accept connections on the current thread.
+    fn serve<'scope, 'server: 'scope>(
+        &'server self,
+        scope: &'scope Scope<'scope, '_>,
+        executor: &'scope Executor<'server>,
+        stop: &Receiver<()>,
+    ) -> Result<(), Error> {
+        for _ in 0..self.threads.get() {
+            let stop = stop.clone();
+            thread::Builder::new().spawn_scoped(scope, move || {
+                let _ = async_io::block_on(executor.run(stop.recv()));
+            })?;
+        }
+
+        let accept_loop = accept_connections(&self.listener, &self.handler, self.limits, executor);
+        async_io::block_on(accept_loop)
+    }
+}
+
+/// Builds a [`Server`] with other limits or another number of threads than the defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerBuilder {
+    limits: Limits,
+    threads: NonZeroUsize,
+}
+
+impl ServerBuilder {
+    /// Start from the defaults.
+    pub fn new() -> Self {
+        let threads = thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+
+        Self {
+            limits: Limits::default(),
+            threads,
+        }
+    }
+
+    /// Set the largest request line plus headers in bytes, [`DEFAULT_MAX_HEAD_BYTES`](crate::DEFAULT_MAX_HEAD_BYTES) by default; a larger head gets `431 Request Header Fields Too Large`.
+    #[must_use]
+    pub fn max_head_bytes(mut self, max_head_bytes: usize) -> Self {
+        self.limits.max_head_bytes = max_head_bytes;
+        self
+    }
+
+    /// Set the largest request body in bytes, [`DEFAULT_MAX_BODY_BYTES`](crate::DEFAULT_MAX_BODY_BYTES) by default; a larger `Content-Length` gets `413 Content Too Large` before the body is read.
+    #[must_use]
+    pub fn max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.limits.max_body_bytes = max_body_bytes;
+        self
+    }
+
+    /// Set the number of threads that serve the connections, by default the number of CPUs ([`thread::available_parallelism`]), or one if it is unknown.
+    #[must_use]
+    pub fn threads(mut self, threads: NonZeroUsize) -> Self {
+        self.threads = threads;
+        self
+    }
+
+    /// Bind `addr` and create a server with these settings that routes every request to `handler`.
+    ///
+    /// `addr` is any address `async-net` can resolve, such as `"127.0.0.1:8080"`.
+    /// Binding port `0` lets the operating system pick a free port; [`Server::local_addr`] reports which one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the address cannot be bound.
+    pub fn bind<A: AsyncToSocketAddrs, H: Handler>(
+        self,
+        addr: A,
+        handler: H,
+    ) -> Result<Server<H>, Error> {
+        let listener = async_io::block_on(TcpListener::bind(addr))?;
+
+        Ok(Server {
+            listener,
+            handler,
+            limits: self.limits,
+            threads: self.threads,
+        })
+    }
+}
+
+impl Default for ServerBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -62,6 +158,7 @@ impl<H: Handler> Server<H> {
 async fn accept_connections<'a, H: Handler>(
     listener: &TcpListener,
     handler: &'a H,
+    limits: Limits,
     executor: &Executor<'a>,
 ) -> Result<(), Error> {
     loop {
@@ -71,7 +168,7 @@ async fn accept_connections<'a, H: Handler>(
         // if this fails the connection still works, only a bit slower
         let _ = stream.set_nodelay(true);
 
-        let task = serve_connection(stream.clone(), stream, handler);
+        let task = serve_connection(stream.clone(), stream, handler, limits);
         executor.spawn(task).detach();
     }
 }
@@ -81,13 +178,13 @@ async fn accept_connections<'a, H: Handler>(
 /// Errors end the connection.
 /// Protocol errors get a final status-only response first, so the peer learns why; transport errors do not, because there is nothing left to write to.
 /// Waiting longer than [`IDLE_TIMEOUT`] for the next request, or a read or write that exceeds [`CONNECTION_TIMEOUT`], ends the connection silently.
-async fn serve_connection<R, W, H>(input: R, output: W, handler: &H)
+async fn serve_connection<R, W, H>(input: R, output: W, handler: &H, limits: Limits)
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
     H: Handler,
 {
-    let mut reader = RequestReader::new(input);
+    let mut reader = RequestReader::new(input, limits);
     let mut writer = ResponseWriter::new(output);
 
     loop {

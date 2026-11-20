@@ -10,7 +10,7 @@ use futures_lite::io::{AsyncRead, AsyncReadExt};
 use http::request::Parts;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri, Version, header};
 
-use crate::{Body, Error, MAX_BODY_BYTES, MAX_HEAD_BYTES, MAX_HEADERS};
+use crate::{Body, Error, Limits, MAX_HEADERS};
 
 /// How many bytes to ask the socket for per `read` call.
 const READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -18,17 +18,17 @@ const READ_CHUNK_BYTES: usize = 8 * 1024;
 /// Reads whole requests off a byte stream, one at a time.
 pub(crate) struct RequestReader<R> {
     reader: R,
+    limits: Limits,
     buffer: BytesMut,
-    scratch: Box<[u8]>,
 }
 
 impl<R: AsyncRead + Unpin> RequestReader<R> {
-    /// Wrap a readable stream.
-    pub(crate) fn new(reader: R) -> Self {
+    /// Wrap a readable stream whose requests must fit in `limits`.
+    pub(crate) fn new(reader: R, limits: Limits) -> Self {
         Self {
             reader,
+            limits,
             buffer: BytesMut::new(),
-            scratch: vec![0; READ_CHUNK_BYTES].into_boxed_slice(),
         }
     }
 
@@ -54,7 +54,7 @@ impl<R: AsyncRead + Unpin> RequestReader<R> {
 
         let head = self.buffer.split_to(head_len).freeze();
         let parts = parse_head(&head)?;
-        let content_length = content_length(&parts.headers)?;
+        let content_length = content_length(&parts.headers, self.limits.max_body_bytes)?;
 
         // we do not reserve, only alloc when real body is coming
         while self.buffer.len() < content_length {
@@ -70,17 +70,22 @@ impl<R: AsyncRead + Unpin> RequestReader<R> {
 
     /// Read until a whole head is buffered and return its length, or `None` on a clean end-of-stream at a request boundary.
     async fn locate_head(&mut self) -> Result<Option<usize>, Error> {
+        let max_head_bytes = self.limits.max_head_bytes;
+        let head_too_large = Error::HeadTooLarge {
+            limit: max_head_bytes,
+        };
+
         loop {
             if let Some(head_len) = complete_head_len(&self.buffer)? {
-                if head_len > MAX_HEAD_BYTES {
-                    return Err(Error::HeadTooLarge);
+                if head_len > max_head_bytes {
+                    return Err(head_too_large);
                 }
 
                 return Ok(Some(head_len));
             }
 
-            if self.buffer.len() > MAX_HEAD_BYTES {
-                return Err(Error::HeadTooLarge);
+            if self.buffer.len() > max_head_bytes {
+                return Err(head_too_large);
             }
 
             if self.fill().await? == 0 {
@@ -95,9 +100,15 @@ impl<R: AsyncRead + Unpin> RequestReader<R> {
 
     /// Append one chunk from the stream to the buffer and return how many bytes arrived, `0` at end-of-stream.
     async fn fill(&mut self) -> Result<usize, Error> {
-        let received = self.reader.read(&mut self.scratch).await?;
-        self.buffer.extend_from_slice(&self.scratch[..received]);
-        Ok(received)
+        let filled = self.buffer.len();
+
+        // read straight into the buffer, the zeroed tail is cut back to what arrived
+        self.buffer.resize(filled + READ_CHUNK_BYTES, 0);
+        let read = self.reader.read(&mut self.buffer[filled..]).await;
+        let received = read.as_ref().map_or(0, |received| *received);
+        self.buffer.truncate(filled + received);
+
+        Ok(read?)
     }
 }
 
@@ -170,8 +181,8 @@ fn build_parts(
 
 /// Determine how many body bytes follow the head.
 ///
-/// Rejects chunked requests, a duplicated or unparseable `Content-Length`, and a length above [`MAX_BODY_BYTES`].
-fn content_length(headers: &HeaderMap) -> Result<usize, Error> {
+/// Rejects chunked requests, a duplicated or unparseable `Content-Length`, and a length above `max_body_bytes`.
+fn content_length(headers: &HeaderMap, max_body_bytes: usize) -> Result<usize, Error> {
     if headers.contains_key(header::TRANSFER_ENCODING) {
         return Err(Error::UnsupportedTransferEncoding);
     }
@@ -193,8 +204,10 @@ fn content_length(headers: &HeaderMap) -> Result<usize, Error> {
         .parse()
         .map_err(|_| Error::InvalidContentLength)?;
 
-    if length > MAX_BODY_BYTES {
-        return Err(Error::BodyTooLarge);
+    if length > max_body_bytes {
+        return Err(Error::BodyTooLarge {
+            limit: max_body_bytes,
+        });
     }
 
     Ok(length)

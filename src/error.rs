@@ -2,8 +2,6 @@
 
 use http::StatusCode;
 
-use crate::{MAX_BODY_BYTES, MAX_HEAD_BYTES};
-
 /// Everything that can go wrong while serving a connection.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -24,13 +22,19 @@ pub enum Error {
     #[error("invalid request field")]
     InvalidField(#[from] http::Error),
 
-    /// The request line and headers exceeded [`MAX_HEAD_BYTES`].
-    #[error("request head exceeds {} bytes", MAX_HEAD_BYTES)]
-    HeadTooLarge,
+    /// The request line and headers exceeded the limit of [`ServerBuilder::max_head_bytes`](crate::ServerBuilder::max_head_bytes).
+    #[error("request head exceeds {limit} bytes")]
+    HeadTooLarge {
+        /// The limit, in bytes.
+        limit: usize,
+    },
 
-    /// `Content-Length` exceeded [`MAX_BODY_BYTES`].
-    #[error("request body exceeds {} bytes", MAX_BODY_BYTES)]
-    BodyTooLarge,
+    /// `Content-Length` exceeded the limit of [`ServerBuilder::max_body_bytes`](crate::ServerBuilder::max_body_bytes).
+    #[error("request body exceeds {limit} bytes")]
+    BodyTooLarge {
+        /// The limit, in bytes.
+        limit: usize,
+    },
 
     /// `Content-Length` was absent-but-required, duplicated, or not a number.
     #[error("missing or malformed Content-Length")]
@@ -54,8 +58,8 @@ impl Error {
             | Error::InvalidField(_)
             | Error::InvalidContentLength
             | Error::UnsupportedVersion => Some(StatusCode::BAD_REQUEST),
-            Error::HeadTooLarge => Some(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
-            Error::BodyTooLarge => Some(StatusCode::PAYLOAD_TOO_LARGE),
+            Error::HeadTooLarge { .. } => Some(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
+            Error::BodyTooLarge { .. } => Some(StatusCode::PAYLOAD_TOO_LARGE),
             Error::UnsupportedTransferEncoding => Some(StatusCode::NOT_IMPLEMENTED),
         }
     }
